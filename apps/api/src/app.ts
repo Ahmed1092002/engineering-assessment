@@ -4,8 +4,11 @@ import cors from "@fastify/cors";
 import Fastify from "fastify";
 import {
   ApplicationNotFoundError,
+  DuplicateStatusEventError,
   getApplication,
+  InvalidStatusTransitionError,
   recordStatusEvent,
+  StaleStatusEventError,
 } from "./application-service.js";
 
 interface BuildAppOptions {
@@ -32,6 +35,7 @@ export function buildApp(options: BuildAppOptions = {}) {
       const application = await getApplication(
         database,
         request.params.applicationId,
+        customerId,
       );
 
       if (!application) {
@@ -68,6 +72,15 @@ export function buildApp(options: BuildAppOptions = {}) {
       } catch (error) {
         if (error instanceof ApplicationNotFoundError) {
           return reply.code(404).send({ error: "application not found" });
+        }
+        if (error instanceof DuplicateStatusEventError) {
+          return reply.code(409).send({ error: "duplicate status event" });
+        }
+        if (error instanceof StaleStatusEventError) {
+          return reply.code(409).send({ error: "stale status event" });
+        }
+        if (error instanceof InvalidStatusTransitionError) {
+          return reply.code(422).send({ error: "invalid status transition" });
         }
         throw error;
       }

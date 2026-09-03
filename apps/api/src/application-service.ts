@@ -9,12 +9,50 @@ export class ApplicationNotFoundError extends Error {
   }
 }
 
+export class DuplicateStatusEventError extends Error {
+  constructor(eventId: string) {
+    super(`Status event ${eventId} was already recorded`);
+    this.name = "DuplicateStatusEventError";
+  }
+}
+
+export class StaleStatusEventError extends Error {
+  constructor(eventId: string) {
+    super(`Status event ${eventId} is older than the current application state`);
+    this.name = "StaleStatusEventError";
+  }
+}
+
+export class InvalidStatusTransitionError extends Error {
+  constructor(from: string, to: string) {
+    super(`Cannot transition application from ${from} to ${to}`);
+    this.name = "InvalidStatusTransitionError";
+  }
+}
+
+const allowedTransitions: Record<ApplicationStatus, ApplicationStatus[]> = {
+  SUBMITTED: ["IN_REVIEW"],
+  IN_REVIEW: ["OFFERED", "DECLINED"],
+  OFFERED: ["APPROVED", "DECLINED"],
+  APPROVED: ["DISBURSED"],
+  DECLINED: [],
+  DISBURSED: [],
+};
+
+function assertLegalTransition(from: ApplicationStatus, to: ApplicationStatus) {
+  if (from === to) return;
+  if (!allowedTransitions[from].includes(to)) {
+    throw new InvalidStatusTransitionError(from, to);
+  }
+}
+
 export async function getApplication(
   database: PrismaClient,
   applicationId: string,
+  customerId?: string,
 ): Promise<ApplicationView | null> {
-  const application = await database.loanApplication.findUnique({
-    where: { id: applicationId },
+  const application = await database.loanApplication.findFirst({
+    where: { id: applicationId, ...(customerId ? { customerId } : {}) },
     include: {
       customer: true,
       history: { orderBy: { occurredAt: "desc" } },
@@ -51,42 +89,68 @@ export async function recordStatusEvent(
   applicationId: string,
   event: StatusEventInput,
 ): Promise<ApplicationView> {
-  const application = await database.loanApplication.findUnique({
-    where: { id: applicationId },
-  });
+  await database.$transaction(async (tx) => {
+    const application = await tx.loanApplication.findUnique({
+      where: { id: applicationId },
+    });
 
-  if (!application) throw new ApplicationNotFoundError(applicationId);
+    if (!application) throw new ApplicationNotFoundError(applicationId);
 
-  await database.loanApplication.update({
-    where: { id: applicationId },
-    data: {
-      status: event.status,
-      lastEventOccurredAt: new Date(event.occurredAt),
-    },
-  });
+    const duplicate = await tx.applicationStatusHistory.findUnique({
+      where: {
+        applicationId_sourceEventId: {
+          applicationId,
+          sourceEventId: event.eventId,
+        },
+      },
+    });
 
-  await database.applicationStatusHistory.create({
-    data: {
-      id: randomUUID(),
-      applicationId,
-      status: event.status,
-      reason: event.reason,
-      sourceEventId: event.eventId,
-      occurredAt: new Date(event.occurredAt),
-    },
-  });
+    if (duplicate) throw new DuplicateStatusEventError(event.eventId);
 
-  await database.notificationJob.create({
-    data: {
-      id: randomUUID(),
-      applicationId,
-      sourceEventId: event.eventId,
-      type: "APPLICATION_STATUS_CHANGED",
-      payload: JSON.stringify({
+    const occurredAt = new Date(event.occurredAt);
+    if (
+      application.lastEventOccurredAt &&
+      occurredAt <= application.lastEventOccurredAt
+    ) {
+      throw new StaleStatusEventError(event.eventId);
+    }
+
+    assertLegalTransition(
+      application.status as ApplicationStatus,
+      event.status,
+    );
+
+    await tx.loanApplication.update({
+      where: { id: applicationId },
+      data: {
         status: event.status,
-        reason: event.reason ?? null,
-      }),
-    },
+        lastEventOccurredAt: occurredAt,
+      },
+    });
+
+    await tx.applicationStatusHistory.create({
+      data: {
+        id: randomUUID(),
+        applicationId,
+        status: event.status,
+        reason: event.reason,
+        sourceEventId: event.eventId,
+        occurredAt,
+      },
+    });
+
+    await tx.notificationJob.create({
+      data: {
+        id: randomUUID(),
+        applicationId,
+        sourceEventId: event.eventId,
+        type: "APPLICATION_STATUS_CHANGED",
+        payload: JSON.stringify({
+          status: event.status,
+          reason: event.reason ?? null,
+        }),
+      },
+    });
   });
 
   const updated = await getApplication(database, applicationId);
